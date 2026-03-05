@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -289,6 +290,12 @@ func (s *Server) AddListener(l listeners.Listener) error {
 		return ErrListenerIDExists
 	}
 
+	// Inject the event-driven handler for NBioTCP listeners so they can call
+	// server methods from nbio callbacks without per-connection goroutines.
+	if nbioL, ok := l.(*listeners.NBioTCP); ok {
+		nbioL.SetHandler(s)
+	}
+
 	nl := s.Log.With(slog.String("listener", l.ID()))
 	err := l.Init(nl)
 	if err != nil {
@@ -407,7 +414,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	defer s.Listeners.ClientsWg.Done()
 	s.Listeners.ClientsWg.Add(1)
 
-	go cl.WriteLoop()
+	// DirectWrite clients (nbio event-driven) do not need a WriteLoop goroutine
+	// because writes go directly to the non-blocking nbio.Conn.
+	if !cl.Net.DirectWrite {
+		go cl.WriteLoop()
+	}
 	defer cl.Stop(nil)
 
 	pk, err := s.readConnectionPacket(cl)
@@ -1097,6 +1108,21 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		return out, packets.CodeDisconnect
 	}
 
+	// DirectWrite: nbio event-driven clients write synchronously to the non-blocking
+	// nbio.Conn, bypassing the outbound channel and eliminating the WriteLoop goroutine.
+	if cl.Net.DirectWrite {
+		if err := cl.WritePacket(out); err != nil {
+			atomic.AddInt64(&s.Info.MessagesDropped, 1)
+			cl.ops.hooks.OnPublishDropped(cl, pk)
+			if out.FixedHeader.Qos > 0 {
+				cl.State.Inflight.Delete(out.PacketID)
+				cl.State.Inflight.IncreaseSendQuota()
+			}
+			return out, err
+		}
+		return out, nil
+	}
+
 	select {
 	case cl.State.outbound <- &out:
 		atomic.AddInt32(&cl.State.outboundQty, 1)
@@ -1693,10 +1719,32 @@ func (s *Server) loadRetained(v []storage.Message) {
 }
 
 // clearExpiredClients deletes all clients which have been disconnected for longer
-// than their given expiry intervals.
+// than their given expiry intervals. For active DirectWrite (nbio) clients it also
+// enforces MQTT keepalive by checking the last-activity timestamp.
 func (s *Server) clearExpiredClients(dt int64) {
+	now := time.Now()
 	for id, client := range s.Clients.GetAll() {
 		disconnected := client.StopTime()
+
+		// For connected nbio clients, enforce keepalive via activity timestamp.
+		// SetReadDeadline/SetDeadline cannot be used safely on nbio (timer.Reset race).
+		if disconnected == 0 && client.Net.DirectWrite && client.State.Keepalive > 0 {
+			lastActivity := atomic.LoadInt64(&client.Net.Activity)
+			if lastActivity > 0 {
+				// [MQTT-3.1.2-22]: server must close connection idle for keepalive * 1.5
+				deadline := time.Unix(0, lastActivity).Add(
+					time.Duration(client.State.Keepalive+(client.State.Keepalive/2)) * time.Second,
+				)
+				if now.After(deadline) {
+					s.Log.Debug("nbio: keepalive timeout, closing idle client",
+						"client", client.ID, "remote", client.Net.Remote,
+						"keepalive", client.State.Keepalive)
+					client.Stop(packets.ErrKeepAliveTimeout)
+				}
+			}
+			continue
+		}
+
 		if disconnected == 0 {
 			continue
 		}
@@ -1761,6 +1809,192 @@ func (s *Server) sendDelayedLWT(dt int64) {
 // Int64toa converts an int64 to a string.
 func Int64toa(v int64) string {
 	return strconv.FormatInt(v, 10)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NBio event-driven connection handling (listeners.NBioSessionHandler)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// nbioConnState holds the per-connection state for nbio event-driven connections.
+// One instance exists per accepted TCP connection; no goroutine is associated.
+type nbioConnState struct {
+	cl       *Client
+	parser   *listeners.PacketParser // incremental MQTT packet parser
+	listener string
+	phase    int32      // 0 = waiting for CONNECT, 1 = connected
+	endOnce  sync.Once  // ensure OnNbioClose cleanup runs exactly once
+}
+
+// OnNbioOpen implements listeners.NBioSessionHandler.
+// Called by the nbio engine when a new connection is ready for MQTT traffic
+// (after rate limiting; for TLS, after the handshake completes).
+// No per-connection goroutine is started here.
+func (s *Server) OnNbioOpen(listenerID string, conn net.Conn) interface{} {
+	s.Listeners.ClientsWg.Add(1)
+	cl := s.NewClient(conn, listenerID, "", false)
+	cl.Net.DirectWrite = true // writes go directly to nbio.Conn (non-blocking)
+	atomic.StoreInt64(&cl.Net.Activity, time.Now().UnixNano())
+	return &nbioConnState{
+		cl:       cl,
+		parser:   listeners.NewPacketParser(),
+		listener: listenerID,
+	}
+}
+
+// OnNbioData implements listeners.NBioSessionHandler.
+// Called by the nbio engine when data arrives on a connection. Runs in nbio's
+// goroutine pool — no blocking I/O. Returns an error to signal the engine to
+// close the connection.
+func (s *Server) OnNbioData(session interface{}, data []byte) error {
+	state := session.(*nbioConnState)
+	state.parser.Feed(data)
+
+	// Update receive byte counter and last-activity timestamp (for keepalive enforcement).
+	atomic.AddInt64(&s.Info.BytesReceived, int64(len(data)))
+	atomic.StoreInt64(&state.cl.Net.Activity, time.Now().UnixNano())
+
+	for {
+		// If the client was stopped mid-batch (e.g. by processDisconnect or
+		// DisconnectClient), stop processing buffered packets immediately.
+		// The goroutine-based Read loop gets this for free because the next
+		// cl.ReadFixedHeader call fails on a closed conn; here we must check
+		// explicitly.
+		if state.cl.Closed() {
+			return nil
+		}
+
+		pk, ok, err := state.parser.Next(state.cl.Properties.ProtocolVersion)
+		if err != nil {
+			s.Log.Warn("nbio: packet parse error", "client", state.cl.ID, "remote", state.cl.Net.Remote, "error", err)
+			return err
+		}
+		if !ok {
+			break
+		}
+
+		atomic.AddInt64(&s.Info.PacketsReceived, 1)
+
+		if atomic.LoadInt32(&state.phase) == 0 {
+			// First packet must be CONNECT.
+			if pk.FixedHeader.Type != packets.Connect {
+				s.Log.Warn("nbio: first packet not CONNECT", "remote", state.cl.Net.Remote, "type", pk.FixedHeader.Type)
+				return packets.ErrProtocolViolationRequireFirstConnect
+			}
+			if err = s.processNbioConnect(state, pk); err != nil {
+				s.Log.Warn("nbio: connect failed", "remote", state.cl.Net.Remote, "error", err)
+				return err
+			}
+		} else {
+			// Run the OnPacketRead hook (mirrors cl.ReadPacket behaviour).
+			pk, err = state.cl.ops.hooks.OnPacketRead(state.cl, pk)
+			if err != nil {
+				s.Log.Warn("nbio: OnPacketRead hook error", "client", state.cl.ID, "error", err)
+				return err
+			}
+			if pk.FixedHeader.Type == packets.Publish {
+				atomic.AddInt64(&s.Info.MessagesReceived, 1)
+			}
+			if err = s.receivePacket(state.cl, pk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// OnNbioClose implements listeners.NBioSessionHandler.
+// Called by the nbio engine when a connection closes (with or without error).
+// Cleanup runs exactly once via sync.Once.
+func (s *Server) OnNbioClose(session interface{}, err error) {
+	state := session.(*nbioConnState)
+	state.endOnce.Do(func() {
+		cl := state.cl
+
+		if atomic.LoadInt32(&state.phase) == 1 {
+			// Connection reached the fully-connected state.
+			s.sendLWT(cl)
+			cl.Properties.Will = Will{} // [MQTT-3.14.4-3] [MQTT-3.1.2-10]
+
+			expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) ||
+				(cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
+			s.hooks.OnDisconnect(cl, err, expire)
+
+			if expire && !cl.IsTakenOver() {
+				cl.ClearInflights()
+				s.UnsubscribeClient(cl)
+				s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2]
+			}
+
+			atomic.AddInt64(&s.Info.ClientsConnected, -1)
+		}
+
+		cl.Stop(err)
+		s.Listeners.ClientsWg.Done()
+		if err != nil {
+			s.Log.Warn("nbio client disconnected",
+				"error", err, "client", cl.ID,
+				"remote", cl.Net.Remote, "listener", state.listener)
+		} else {
+			s.Log.Debug("nbio client disconnected",
+				"client", cl.ID, "remote", cl.Net.Remote, "listener", state.listener)
+		}
+	})
+}
+
+// processNbioConnect handles the CONNECT packet for an nbio connection.
+// Mirrors the logic in attachClient without blocking.
+func (s *Server) processNbioConnect(state *nbioConnState, pk packets.Packet) error {
+	cl := state.cl
+	cl.ParseConnect(state.listener, pk)
+
+	if atomic.LoadInt64(&s.Info.ClientsConnected) >= s.Options.Capabilities.MaximumClients {
+		if cl.Properties.ProtocolVersion < 5 {
+			_ = s.SendConnack(cl, packets.ErrServerUnavailable, false, nil)
+		} else {
+			_ = s.SendConnack(cl, packets.ErrServerBusy, false, nil)
+		}
+		return packets.ErrServerBusy
+	}
+
+	code := s.validateConnect(cl, pk) // [MQTT-3.1.4-1] [MQTT-3.1.4-2]
+	if code != packets.CodeSuccess {
+		_ = s.SendConnack(cl, code, false, nil)
+		return code // [MQTT-3.2.2-7] [MQTT-3.1.4-6]
+	}
+
+	if err := s.hooks.OnConnect(cl, pk); err != nil {
+		return err
+	}
+
+	cl.refreshDeadline(cl.State.Keepalive)
+
+	if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
+		_ = s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
+		return packets.ErrBadUsernameOrPassword
+	}
+
+	atomic.AddInt64(&s.Info.ClientsConnected, 1)
+	s.hooks.OnSessionEstablish(cl, pk)
+
+	sessionPresent := s.inheritClientSession(pk, cl)
+	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+
+	if err := s.SendConnack(cl, packets.CodeSuccess, sessionPresent, nil); err != nil {
+		return fmt.Errorf("ack connection packet: %w", err)
+	}
+
+	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
+
+	if sessionPresent {
+		if err := cl.ResendInflightMessages(true); err != nil {
+			return fmt.Errorf("resend inflight: %w", err)
+		}
+	}
+
+	s.hooks.OnSessionEstablished(cl, pk)
+	atomic.StoreInt32(&state.phase, 1) // transition: now fully connected
+
+	return nil
 }
 
 // minimum differs from built-in min, it returns minimum of the non-zero value a and b.

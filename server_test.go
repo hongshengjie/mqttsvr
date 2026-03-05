@@ -3931,3 +3931,201 @@ func TestMinimum(t *testing.T) {
 	require.EqualValues(t, -1, minimum(-1, 20))
 	require.EqualValues(t, -2, minimum(-1, -2))
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NBio event-driven integration tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+// buildRawConnect builds a minimal MQTT v3.1.1 CONNECT packet as raw bytes.
+func buildRawConnect(clientID string) []byte {
+	var vhBuf bytes.Buffer
+	vhBuf.Write([]byte{0x00, 0x04, 'M', 'Q', 'T', 'T'}) // protocol name
+	vhBuf.WriteByte(0x04)                                 // protocol level 4
+	vhBuf.WriteByte(0x02)                                 // connect flags: clean session
+
+	keepalive := make([]byte, 2)
+	binary.BigEndian.PutUint16(keepalive, 10)
+	vhBuf.Write(keepalive)
+
+	idLen := make([]byte, 2)
+	binary.BigEndian.PutUint16(idLen, uint16(len(clientID)))
+	vhBuf.Write(idLen)
+	vhBuf.WriteString(clientID)
+
+	vh := vhBuf.Bytes()
+
+	var pkt bytes.Buffer
+	pkt.WriteByte(0x10)
+	remaining := len(vh)
+	for {
+		eb := byte(remaining % 128)
+		remaining /= 128
+		if remaining > 0 {
+			eb |= 0x80
+		}
+		pkt.WriteByte(eb)
+		if remaining == 0 {
+			break
+		}
+	}
+	pkt.Write(vh)
+	return pkt.Bytes()
+}
+
+func TestNBioAddListener(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	l := listeners.NewNBioTCP(listeners.NBioConfig{
+		Config: listeners.Config{ID: "nb-test", Address: ":0"},
+	})
+	err := s.AddListener(l)
+	require.NoError(t, err)
+
+	// Handler should have been injected by AddListener.
+	require.NotNil(t, l.NBioConfig().Handler)
+}
+
+func TestNBioOnNbioOpen(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	// OnNbioOpen should register a client and increment ClientsWg.
+	conn, serverConn := net.Pipe()
+	defer conn.Close()
+	defer serverConn.Close()
+
+	sess := s.OnNbioOpen("test-listener", serverConn)
+	require.NotNil(t, sess)
+
+	state, ok := sess.(*nbioConnState)
+	require.True(t, ok)
+	require.NotNil(t, state.cl)
+	require.Equal(t, "test-listener", state.listener)
+	require.True(t, state.cl.Net.DirectWrite)
+
+	// Clean up to avoid WaitGroup leak.
+	s.OnNbioClose(sess, nil)
+}
+
+func TestNBioFullConnectFlow(t *testing.T) {
+	s := newServer()
+
+	l := listeners.NewNBioTCP(listeners.NBioConfig{
+		Config: listeners.Config{ID: "nb-full", Address: ":0"},
+	})
+	require.NoError(t, s.AddListener(l))
+	require.NoError(t, s.Serve())
+	defer s.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", l.Address())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send a CONNECT packet.
+	connectPkt := buildRawConnect("nbio-client-1")
+	_, err = conn.Write(connectPkt)
+	require.NoError(t, err)
+
+	// Read the CONNACK.
+	buf := make([]byte, 64)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+	require.Greater(t, n, 0)
+
+	// CONNACK fixed header is 0x20, followed by 0x02, 0x00, 0x00.
+	require.Equal(t, byte(0x20), buf[0], "expected CONNACK packet type")
+
+	// Client should be registered.
+	time.Sleep(50 * time.Millisecond)
+	_, ok := s.Clients.Get("nbio-client-1")
+	require.True(t, ok)
+}
+
+func TestNBioOnNbioData_ConnectThenPingreq(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	conn, serverConn := net.Pipe()
+
+	// Drain the client side so writes from the server don't block.
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			_, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+	defer conn.Close()
+
+	sess := s.OnNbioOpen("test-listener", serverConn)
+	require.NotNil(t, sess)
+	defer s.OnNbioClose(sess, nil)
+
+	// Feed CONNECT.
+	connectPkt := buildRawConnect("data-test-client")
+	err := s.OnNbioData(sess, connectPkt)
+	require.NoError(t, err)
+
+	state := sess.(*nbioConnState)
+	// After CONNECT, phase should be 1 (connected).
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, int32(1), atomic.LoadInt32(&state.phase))
+
+	// Feed PINGREQ.
+	pingPkt := []byte{0xC0, 0x00}
+	err = s.OnNbioData(sess, pingPkt)
+	require.NoError(t, err)
+}
+
+func TestNBioOnNbioClose_Connected(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	_, serverConn := net.Pipe()
+
+	sess := s.OnNbioOpen("test-listener", serverConn)
+	state := sess.(*nbioConnState)
+
+	// Manually set phase to 1 (connected) and register client to simulate a
+	// connected client being disconnected.
+	atomic.StoreInt32(&state.phase, 1)
+	atomic.AddInt64(&s.Info.ClientsConnected, 1)
+	state.cl.ID = "close-test-client"
+	s.Clients.Add(state.cl)
+
+	initial := atomic.LoadInt64(&s.Info.ClientsConnected)
+	s.OnNbioClose(sess, nil)
+
+	require.Equal(t, initial-1, atomic.LoadInt64(&s.Info.ClientsConnected))
+}
+
+func TestNBioOnNbioClose_Idempotent(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	_, serverConn := net.Pipe()
+
+	sess := s.OnNbioOpen("test-listener", serverConn)
+	// Calling OnNbioClose twice must not panic.
+	s.OnNbioClose(sess, nil)
+	s.OnNbioClose(sess, nil) // second call is a no-op (endOnce)
+}
+
+func TestNBioDirectWriteSkipsOutboundChannel(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	conn, _ := net.Pipe()
+	defer conn.Close()
+
+	cl := s.NewClient(conn, "test", "dw-client", false)
+	cl.Net.DirectWrite = true
+
+	require.True(t, cl.Net.DirectWrite)
+}

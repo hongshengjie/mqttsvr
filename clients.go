@@ -113,12 +113,14 @@ type Client struct {
 
 // ClientConnection contains the connection transport and metadata for the client.
 type ClientConnection struct {
-	Conn     net.Conn      // the net.Conn used to establish the connection
-	bconn    *bufio.Reader // a buffered net.Conn for reading packets
-	outbuf   *bytes.Buffer // a buffer for writing packets
-	Remote   string        // the remote address of the client
-	Listener string        // listener id of the client
-	Inline   bool          // if true, the client is the built-in 'inline' embedded client
+	Conn        net.Conn      // the net.Conn used to establish the connection
+	bconn       *bufio.Reader // a buffered net.Conn for reading packets
+	outbuf      *bytes.Buffer // a buffer for writing packets
+	Remote      string        // the remote address of the client
+	Listener    string        // listener id of the client
+	Inline      bool          // if true, the client is the built-in 'inline' embedded client
+	DirectWrite bool          // if true, writes bypass the outbound channel (nbio event-driven clients)
+	Activity    int64         // last activity time as unix nanoseconds (used by nbio keepalive checker)
 }
 
 // ClientProperties contains the properties which define the client behaviour.
@@ -265,9 +267,21 @@ func (cl *Client) refreshDeadline(keepalive uint16) {
 		expiry = time.Now().Add(time.Duration(keepalive+(keepalive/2)) * time.Second) // [MQTT-3.1.2-22]
 	}
 
-	if cl.Net.Conn != nil {
-		_ = cl.Net.Conn.SetDeadline(expiry) // [MQTT-3.1.2-22]
+	if cl.Net.Conn == nil {
+		return
 	}
+
+	// DirectWrite clients (nbio) must not use SetReadDeadline/SetDeadline.
+	// nbio implements deadlines via time.AfterFunc+timer.Reset, which has a known
+	// Go race: when the timer fires the callback goroutine is already scheduled and
+	// cannot be cancelled by Reset. Calling SetReadDeadline after every packet from
+	// OnData triggers this race at high frequency, causing spurious "read timeout"
+	// closures. Instead, keepalive for nbio clients is enforced by the server's
+	// background clearExpiredClients loop via the Activity timestamp.
+	if cl.Net.DirectWrite {
+		return
+	}
+	_ = cl.Net.Conn.SetDeadline(expiry) // [MQTT-3.1.2-22]
 }
 
 // NextPacketID returns the next available (unused) packet id for the client.
